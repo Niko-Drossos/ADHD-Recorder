@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     duration_sec    REAL,
     transcript      TEXT,
 
-    -- pending -> done | failed | empty
+    -- pending -> done | failed | empty | paused
     status          TEXT NOT NULL DEFAULT 'pending',
     error           TEXT,
 
@@ -39,3 +39,13 @@ CREATE INDEX IF NOT EXISTS chunks_status_idx
 CREATE INDEX IF NOT EXISTS chunks_transcript_fts_idx
     ON chunks
     USING GIN (to_tsvector('english', coalesce(transcript, '')));
+
+-- Windows during which recording is paused. Any chunk overlapping one is
+-- discarded. (main.py also creates this on startup for databases that
+-- predate it, since this file only runs on first boot.)
+CREATE TABLE IF NOT EXISTS pauses (
+    id          BIGSERIAL PRIMARY KEY,
+    starts_at   TIMESTAMPTZ NOT NULL,
+    ends_at     TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

@@ -42,6 +42,9 @@ All endpoints except `/health` require `Authorization: Bearer $INGEST_TOKEN`.
 | GET | `/summary?minutes=10` | **The main one.** LLM summary of what you were just doing |
 | GET | `/transcript?minutes=10` | Raw transcript text for the window |
 | GET | `/search?q=dentist` | Full-text search across all history |
+| POST | `/pause?minutes=60` | Pause recording. Pressing it again while paused resets the end time to N minutes from now |
+| GET | `/pause` | `{"paused": true, "until": "..."}`, or `{"paused": false, "until": null}` |
+| DELETE | `/pause` | Resume now |
 | GET | `/health` | Liveness + queue depth |
 
 Test an upload by hand:
@@ -59,9 +62,10 @@ Runs continuously. Start on boot.
 
 1. **Variable Set** — `%server` = `http://<tailscale-ip>:8000`, `%token` = your token, `%queue` = `/storage/emulated/0/RecallQueue/`
 2. **Loop:**
-   1. **Variable Set** — `%started` = `now()` *(capture the timestamp before recording, not after)*
-   2. **Record audio** — 300 seconds, output to `%queue` + `%started` + `.m4a`
-   3. **Fork** → continue the loop immediately; upload happens on the other branch so recording never pauses
+   1. **HTTP request** — GET `%server/pause`. **If** `paused` is true → **Delay** 60s and restart the loop. *(If the request fails, e.g. you're offline, keep recording. The server will still discard anything recorded during a pause once the chunk is uploaded.)*
+   2. **Variable Set** — `%started` = `now()` *(capture the timestamp before recording, not after)*
+   3. **Record audio** — 300 seconds, output to `%queue` + `%started` + `.m4a`
+   4. **Fork** → continue the loop immediately; upload happens on the other branch so recording never pauses
 3. **Upload branch:**
    1. **HTTP request** — POST `%server/ingest`, multipart: `audio` = file, `recorded_at` = ISO-8601 of `%started`
    2. Header: `Authorization: Bearer %token`
@@ -81,6 +85,17 @@ Bind to a home-screen shortcut or quick-settings tile:
 1. **HTTP request** — GET `%server/summary?minutes=10` with the auth header
 2. **Speak text** (TTS) or **Notification** with the `summary` field
 
+## Automate flow 4 — pause tile
+
+Bind to a second quick-settings tile:
+
+1. **HTTP request** — POST `%server/pause?minutes=60` with the auth header
+2. **Notification** — "Recording paused until `until`"
+
+Add a "Resume" action that sends DELETE `%server/pause`.
+
+The server enforces the pause, so audio is dropped even if the phone records it anyway. Uploads recorded during a pause get a 200 but are not stored, and the phone deletes them as normal. A chunk that was already recording when you pressed pause overlaps the pause window, so the whole chunk is discarded, including the minutes before you pressed it. That errs on the side of the people around you.
+
 ## Tuning
 
 **Chunk length.** 300s is a reasonable default. Shorter chunks mean fresher data — a 5-minute chunk isn't transcribed until it's finished, so worst case your "last 10 minutes" is missing the most recent 5. If that lag bothers you, drop to 120s; the cost is more HTTP requests and more per-chunk Whisper overhead.
@@ -99,7 +114,7 @@ Bind to a home-screen shortcut or quick-settings tile:
 DELETE FROM chunks WHERE recorded_at < now() - interval '90 days';
 ```
 
-**Other people.** This records everyone in range, not just you. Recording-consent law varies by state and country, and some jurisdictions require all-party consent. Worth deciding deliberately where this runs — and there's a real argument for a "pause for an hour" tile, both for legal reasons and for the people around you.
+**Other people.** This records everyone in range, not just you. Recording-consent law varies by state and country, and some jurisdictions require all-party consent. Worth deciding deliberately where this runs — which is what the pause tile (flow 4) is for.
 
 **Encryption at rest.** The Postgres volume and audio directory are plaintext on the host. If the homelab disk isn't already encrypted, that's the weak link in an otherwise-private pipeline.
 
