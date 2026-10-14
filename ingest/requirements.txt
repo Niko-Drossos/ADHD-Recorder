@@ -3,4 +3,6 @@ uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 psycopg[binary,pool]==3.2.3
 faster-whisper==1.1.0
+# faster-whisper imports requests but newer huggingface_hub no longer pulls it in.
+requests==2.32.3
 httpx==0.28.1

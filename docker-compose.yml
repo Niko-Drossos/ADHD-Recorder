@@ -38,4 +38,4 @@ services:
     ports:
       # Bind to the Tailscale interface only, not 0.0.0.0.
       # Replace BIND_ADDR in .env with your host's Tailscale IP.
-      - "${BIND_ADDR:-127.0.0.1}:${PORT}:${PORT}"
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-8000}:8000"
