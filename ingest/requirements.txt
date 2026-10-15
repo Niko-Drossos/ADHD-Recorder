@@ -5,4 +5,9 @@ psycopg[binary,pool]==3.2.3
 faster-whisper==1.1.0
 # faster-whisper imports requests but newer huggingface_hub no longer pulls it in.
 requests==2.32.3
+# faster-whisper (up to 1.2.1) calls av.open(metadata_errors=...), removed in PyAV 19.
+av==18.1.0
+# CUDA 12 runtime libraries ctranslate2 loads for WHISPER_DEVICE=cuda.
+nvidia-cublas-cu12==12.*
+nvidia-cudnn-cu12==9.*
 httpx==0.28.1

@@ -21,6 +21,8 @@ services:
     build: ./ingest
     container_name: recall-ingest
     restart: unless-stopped
+    # Expose the NVIDIA GPU for WHISPER_DEVICE=cuda. Remove on CPU-only hosts.
+    gpus: all
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_URL}:5432/${POSTGRES_DB}
       INGEST_TOKEN: ${INGEST_TOKEN}

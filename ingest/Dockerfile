@@ -15,7 +15,8 @@ COPY main.py .
 
 # Cache Whisper model weights on the mounted volume so rebuilds don't re-download.
 ENV HF_HOME=/models \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
 
 EXPOSE 8000
 

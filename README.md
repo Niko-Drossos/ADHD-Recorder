@@ -19,7 +19,11 @@ Pixel (Automate)  ──GET /summary──►       │  ──►  Ollama  ─�
 cp .env.example .env
 openssl rand -hex 32          # paste into INGEST_TOKEN
 tailscale ip -4               # paste into BIND_ADDR
-$EDITOR .env
+$EDITOR .env                  # PORT=8888, POSTGRES_URL=<postgres host>
+
+# Postgres runs outside this stack, so create the schema once.
+# Keep POSTGRES_PASSWORD URL-safe (no @ # : / ?), it is embedded in DATABASE_URL.
+psql -h <postgres host> -U recall -d recall -f db/init.sql
 
 docker compose up -d --build
 docker compose logs -f ingest # first boot downloads the whisper model
@@ -28,7 +32,7 @@ docker compose logs -f ingest # first boot downloads the whisper model
 Verify:
 
 ```bash
-curl -s http://<tailscale-ip>:8000/health
+curl -s http://<tailscale-ip>:8888/health
 # {"ok":true,"queue_depth":0,"model_loaded":true}
 ```
 
@@ -50,17 +54,21 @@ All endpoints except `/health` require `Authorization: Bearer $INGEST_TOKEN`.
 Test an upload by hand:
 
 ```bash
-curl -X POST http://<tailscale-ip>:8000/ingest \
+curl -X POST http://<tailscale-ip>:8888/ingest \
   -H "Authorization: Bearer $INGEST_TOKEN" \
   -F "audio=@test.opus" \
   -F "recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ```
 
+## Phone setup
+
+Two options: the Termux script in [`phone/`](phone/README.md) (install with one command, includes widgets), or build the Automate flows below by hand.
+
 ## Automate flow 1 — recorder/uploader
 
 Runs continuously. Start on boot.
 
-1. **Variable Set** — `%server` = `http://<tailscale-ip>:8000`, `%token` = your token, `%queue` = `/storage/emulated/0/RecallQueue/`
+1. **Variable Set** — `%server` = `http://<tailscale-ip>:8888`, `%token` = your token, `%queue` = `/storage/emulated/0/RecallQueue/`
 2. **Loop:**
    1. **HTTP request** — GET `%server/pause`. **If** `paused` is true → **Delay** 60s and restart the loop. *(If the request fails, e.g. you're offline, keep recording. The server will still discard anything recorded during a pause once the chunk is uploaded.)*
    2. **Variable Set** — `%started` = `now()` *(capture the timestamp before recording, not after)*

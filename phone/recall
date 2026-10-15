@@ -1,0 +1,263 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# recall: phone side of ADHD-Recorder, for Termux + Termux:API.
+# Records audio in fixed-length chunks and uploads them to the ingest server.
+#
+#   recall start | stop | status      background recorder
+#   recall pause [minutes] | resume   server-side pause (mic stops immediately)
+#   recall summary [minutes]          "what was I just doing?"
+#   recall upload                     push anything left in the queue now
+#   recall test                       30s mic check: record, upload, show transcript
+set -u
+
+CONFIG="${RECALL_CONFIG:-$HOME/.config/recall/config}"
+[ -f "$CONFIG" ] || { echo "No config at $CONFIG. Run install.sh first." >&2; exit 1; }
+. "$CONFIG"
+: "${RECALL_SERVER:?missing in config}" "${RECALL_TOKEN:?missing in config}"
+DEVICE="${RECALL_DEVICE:-phone}"
+CHUNK="${RECALL_CHUNK_SECONDS:-300}"
+SPEAK="${RECALL_SPEAK:-0}"
+SELF="$PREFIX/bin/recall"
+
+DATA="$HOME/recall-data"
+RECORDING="$DATA/recording"   # chunk being written right now; never uploaded
+QUEUE="$DATA/queue"           # finished chunks waiting for upload
+FAILED="$DATA/failed"         # chunks the server rejected, kept for inspection
+LOG="$DATA/recall.log"
+PIDFILE="$DATA/recorder.pid"
+mkdir -p "$RECORDING" "$QUEUE" "$FAILED"
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+toast() { termux-toast -s "$1" >/dev/null 2>&1 || true; }
+
+# api METHOD PATH: prints the response body, fails on network or HTTP errors.
+api() {
+  curl -sS --fail-with-body --max-time "${TIMEOUT:-30}" -X "$1" \
+    -H "Authorization: Bearer $RECALL_TOKEN" "$RECALL_SERVER$2"
+}
+
+local_time() { date -d "$1" +%H:%M 2>/dev/null || echo "$1"; }
+
+notify() {
+  termux-notification --id recall --ongoing --priority low \
+    --title "Recall" --content "$1" \
+    --button1 "Pause 1h" --button1-action "$SELF pause 60" \
+    --button2 "Resume" --button2-action "$SELF resume" \
+    --button3 "Stop" --button3-action "$SELF stop" >/dev/null 2>&1 || true
+}
+
+is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+
+# --------------------------------------------------------------------------
+# upload
+# --------------------------------------------------------------------------
+
+# Files are named after the moment recording started (20261014T163000Z.m4a),
+# which is what the server needs as recorded_at, even if upload is hours later.
+upload_one() {
+  local f="$1" name ts iso code
+  name=$(basename "$f")
+  ts="${name%%.*}"
+  iso="${ts:0:4}-${ts:4:2}-${ts:6:2}T${ts:9:2}:${ts:11:2}:${ts:13:2}Z"
+  if [ ! -s "$f" ]; then
+    log "dropping empty $name"; rm -f "$f"; return 0
+  fi
+  code=$(curl -sS -o "$DATA/last-response" -w '%{http_code}' --max-time 300 \
+    -H "Authorization: Bearer $RECALL_TOKEN" \
+    -F "audio=@$f" -F "recorded_at=$iso" -F "device=$DEVICE" \
+    "$RECALL_SERVER/ingest" 2>>"$LOG") || code=000
+  case "$code" in
+    200) rm -f "$f"; log "uploaded $name" ;;
+    400|413|422)
+      mv "$f" "$FAILED/"
+      log "server rejected $name ($code): $(cat "$DATA/last-response")" ;;
+    *) log "upload of $name failed ($code), will retry"; return 1 ;;
+  esac
+}
+
+upload_all() {
+  local lock="$DATA/upload.lock" f rc=0
+  # mkdir is atomic, so only one uploader runs at a time. A lock whose
+  # owner died is taken over.
+  if ! mkdir "$lock" 2>/dev/null; then
+    kill -0 "$(cat "$lock/pid" 2>/dev/null)" 2>/dev/null && return 0
+    rm -rf "$lock"; mkdir "$lock" 2>/dev/null || return 0
+  fi
+  echo "$BASHPID" > "$lock/pid"
+  for f in "$QUEUE"/*; do
+    [ -e "$f" ] || continue
+    # Server unreachable: stop here, the next chunk retries the whole queue.
+    upload_one "$f" || { rc=1; break; }
+  done
+  rm -rf "$lock"
+  return $rc
+}
+
+# --------------------------------------------------------------------------
+# recording
+# --------------------------------------------------------------------------
+
+# termux-microphone-record returns immediately and records in the background,
+# so poll until the recording has actually finished and the file is complete.
+wait_mic_idle() {
+  local i
+  for i in $(seq 1 "$1"); do
+    termux-microphone-record -i 2>/dev/null | grep -q '"isRecording": *true' || return 0
+    sleep 1
+  done
+  return 1
+}
+
+# record_chunk SECONDS: records one chunk, moves it to the queue, prints its path.
+record_chunk() {
+  local secs="$1" ts f
+  ts=$(date -u +%Y%m%dT%H%M%SZ)   # timestamp taken BEFORE recording starts
+  f="$RECORDING/$ts.m4a"
+  termux-microphone-record -q >/dev/null 2>&1   # clear anything left over
+  if ! termux-microphone-record -f "$f" -l "$secs" -e aac -c 1 >/dev/null 2>&1; then
+    log "could not start recording (mic permission? Termux:API installed?)"
+    return 1
+  fi
+  sleep "$secs"
+  wait_mic_idle 30 || termux-microphone-record -q >/dev/null 2>&1
+  mv "$f" "$QUEUE/" 2>/dev/null || { log "no audio file produced for $ts"; return 1; }
+  echo "$QUEUE/$ts.m4a"
+}
+
+flush_recording() {
+  local f
+  for f in "$RECORDING"/*; do [ -e "$f" ] && mv "$f" "$QUEUE/"; done
+}
+
+run_loop() {
+  termux-wake-lock
+  flush_recording   # a chunk interrupted by a crash or reboot
+  log "recorder started"
+  while :; do
+    # Keep the log from growing forever.
+    [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 1000000 ] && \
+      { tail -n 2000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"; }
+
+    # Offline counts as not paused: keep recording. The server still drops
+    # anything recorded during a pause when it is uploaded later.
+    pause=$(api GET /pause 2>/dev/null || true)
+    if echo "$pause" | grep -q '"paused": *true'; then
+      until=$(echo "$pause" | jq -r '.until // empty' 2>/dev/null)
+      notify "Paused until $(local_time "$until")"
+      sleep 60
+      continue
+    fi
+
+    notify "Recording · $(ls "$QUEUE" | wc -l) queued"
+    record_chunk "$CHUNK" >/dev/null || sleep 10
+    upload_all &
+  done
+}
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+cmd_start() {
+  if is_running; then echo "Recorder already running."; return 0; fi
+  nohup "$SELF" _run >>"$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  echo "Recorder started."; toast "Recall: recording"
+}
+
+cmd_stop() {
+  is_running && kill "$(cat "$PIDFILE")"
+  rm -f "$PIDFILE"
+  termux-microphone-record -q >/dev/null 2>&1
+  sleep 1
+  flush_recording   # the partial chunk is finalized once the mic stops
+  termux-notification-remove recall >/dev/null 2>&1
+  termux-wake-unlock
+  log "recorder stopped"
+  nohup "$SELF" upload >/dev/null 2>&1 &
+  echo "Recorder stopped."; toast "Recall: stopped"
+}
+
+cmd_status() {
+  if is_running; then echo "Recorder:  running (pid $(cat "$PIDFILE"))"
+  else echo "Recorder:  stopped"; fi
+  echo "Queued:    $(ls "$QUEUE" | wc -l) chunk(s) waiting to upload"
+  echo "Rejected:  $(ls "$FAILED" | wc -l) chunk(s) in $FAILED"
+  if out=$(TIMEOUT=10 api GET /pause 2>&1); then
+    echo "Server:    reachable, paused=$(echo "$out" | jq -r .paused)"
+  else
+    echo "Server:    NOT reachable ($out)"
+  fi
+  echo; echo "Last log lines:"; tail -n 8 "$LOG" 2>/dev/null
+}
+
+cmd_pause() {
+  local minutes="${1:-60}" out until
+  # Stop the mic right away. The interrupted chunk overlaps the pause, so the
+  # server discards it when it is uploaded.
+  termux-microphone-record -q >/dev/null 2>&1
+  if out=$(api POST "/pause?minutes=$minutes" 2>&1); then
+    until=$(local_time "$(echo "$out" | jq -r .until)")
+    notify "Paused until $until"
+    echo "Paused until $until."; toast "Recall paused until $until"
+  else
+    echo "Pause failed: $out" >&2; toast "Recall: pause FAILED (server unreachable?)"; return 1
+  fi
+}
+
+cmd_resume() {
+  if out=$(api DELETE /pause 2>&1); then
+    echo "Resumed. Recording restarts within a minute."; toast "Recall: resumed"
+  else
+    echo "Resume failed: $out" >&2; toast "Recall: resume FAILED"; return 1
+  fi
+}
+
+cmd_summary() {
+  local minutes="${1:-10}" out text
+  toast "Recall: thinking…"
+  out=$(TIMEOUT=180 api GET "/summary?minutes=$minutes" 2>&1)
+  text=$(echo "$out" | jq -r '.summary // .error // empty' 2>/dev/null)
+  [ -n "$text" ] || text="No answer from server: $out"
+  echo "$text"
+  termux-notification --id recall-summary --title "Last $minutes minutes" \
+    --content "$text" >/dev/null 2>&1
+  [ "$SPEAK" = 1 ] && termux-tts-speak "$(echo "$text" | tr -d '*#')"
+  return 0
+}
+
+cmd_test() {
+  local f size i out
+  if is_running; then echo "Stop the recorder first: recall stop"; return 1; fi
+  echo "Recording 30 seconds. Turn the screen OFF now and talk normally."
+  f=$(record_chunk 30) || { echo "Recording failed, see $LOG"; return 1; }
+  size=$(stat -c %s "$f")
+  echo "Recorded $size bytes. Uploading…"
+  upload_one "$f" || { echo "Upload failed: $(tail -n 1 "$LOG")"; return 1; }
+  echo "Uploaded. Waiting for the transcript (can take a minute or two)…"
+  for i in $(seq 1 60); do
+    out=$(api GET "/transcript?minutes=5" 2>/dev/null | jq -r '.chunks[].text' 2>/dev/null)
+    if [ -n "$out" ]; then
+      echo; echo "Transcript:"; echo "$out"; echo
+      echo "If that matches what you said with the screen off, background recording works."
+      return 0
+    fi
+    sleep 5
+  done
+  echo "No transcript after 5 minutes. Either the recording was silent (Android"
+  echo "blocked the mic with the screen off) or the server is still busy."
+  echo "Check the server with: docker compose logs ingest"
+  return 1
+}
+
+case "${1:-}" in
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  status)  cmd_status ;;
+  pause)   cmd_pause "${2:-60}" ;;
+  resume)  cmd_resume ;;
+  summary) cmd_summary "${2:-10}" ;;
+  upload)  upload_all && echo "Queue empty." || echo "Some uploads failed, see $LOG" ;;
+  test)    cmd_test ;;
+  _run)    run_loop ;;
+  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
